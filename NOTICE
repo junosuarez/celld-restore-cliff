@@ -1,0 +1,7 @@
+worker/index.js and worker/wrangler.jsonc are copied verbatim from
+denoland/celld, examples/counter, which is licensed Apache-2.0:
+
+    https://github.com/denoland/celld/blob/main/LICENSE
+
+They are included unmodified so the reproduction runs the upstream example
+rather than a rewrite of it. Everything else in this repository is MIT.

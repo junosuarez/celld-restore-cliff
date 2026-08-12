@@ -1,0 +1,128 @@
+# Reproduces: a celld cell becomes permanently unactivatable once its LTX
+# replica chain outgrows the activation deadline.
+#
+# The failure condition is
+#     chain_length x per-object fetch latency > activation deadline
+# so on a fast local store you would need ~10,000 objects to cross it. Toxiproxy
+# sits between celld and MinIO so latency can be injected AFTER the chain is
+# built: the write phase runs at full local speed, then one API call makes every
+# object fetch slow. A couple of thousand writes is then enough.
+#
+# One celld node on purpose. The cliff is about restore time versus the
+# activation deadline, not about ownership handoff — a lone node restarting has
+# to rebuild from the bucket too, so one node shows it.
+#
+# Driven by ./run.sh, which starts services by name and sequences the one-shots
+# (createbucket, tools, deploy) with `compose run`. A bare `compose up` would
+# race them.
+
+name: celld-restore-cliff
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: celld
+      MINIO_ROOT_PASSWORD: celldcelld
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  createbucket:
+    image: quay.io/minio/mc:latest
+    entrypoint: >
+      sh -c "mc alias set m http://minio:9000 celld celldcelld &&
+             mc mb --ignore-existing m/celld"
+
+  # Everything celld sends to the store goes through here, so latency can be
+  # turned on mid-run without restarting anything. The proxy is declared in
+  # toxiproxy.json rather than created by an init container: this image is
+  # distroless and has no shell to run the CLI from.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host", "0.0.0.0", "-config", "/etc/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy.json:ro
+    ports:
+      - "8474:8474"   # control API — latency is added through this
+
+  # celld publishes no container image past v0.0.2, so fetch the v0.1.0 release
+  # binary into a shared volume and verify it. esbuild is needed by
+  # `celld deploy` to bundle the Worker.
+  tools:
+    image: docker.io/curlimages/curl:8.11.1
+    volumes:
+      - tools:/opt/celld
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$$(uname -m)" in
+          aarch64|arm64)
+            CT=aarch64-unknown-linux-gnu
+            CS=256d25275ae85371c01a9a7f5dc553be41aedd9c79b656bf6b7154466f003182
+            EB=linux-arm64 ;;
+          x86_64|amd64)
+            CT=x86_64-unknown-linux-gnu
+            CS=139354c28618fe648864598f5cdf69ae91a176b32b90418a813e026e86be9a7c
+            EB=linux-x64 ;;
+          *) echo "unsupported arch $$(uname -m)" >&2; exit 1 ;;
+        esac
+        [ -x /opt/celld/celld ] || {
+          curl -fsSL -o /tmp/c.gz "https://github.com/denoland/celld/releases/download/v0.1.0/celld-$$CT.gz"
+          echo "$$CS  /tmp/c.gz" | sha256sum -c -
+          gunzip -c /tmp/c.gz > /opt/celld/celld && chmod +x /opt/celld/celld
+        }
+        [ -x /opt/celld/esbuild ] || {
+          curl -fsSL -o /tmp/e.tgz "https://registry.npmjs.org/@esbuild/$$EB/-/$$EB-0.28.2.tgz"
+          tar -xzf /tmp/e.tgz -C /tmp
+          cp /tmp/package/bin/esbuild /opt/celld/esbuild && chmod +x /opt/celld/esbuild
+        }
+        echo "tools ready for $$(uname -m)"
+
+  deploy:
+    image: docker.io/library/debian:stable-slim
+    environment:
+      AWS_ACCESS_KEY_ID: celld
+      AWS_SECRET_ACCESS_KEY: celldcelld
+      CELLD_ESBUILD: /opt/celld/esbuild
+    volumes:
+      - tools:/opt/celld
+      - ./worker:/worker:ro
+    entrypoint: >
+      /opt/celld/celld deploy /worker
+        --bucket s3://celld
+        --endpoint http://toxiproxy:9000
+        --region us-east-1
+
+  celld:
+    image: docker.io/library/debian:stable-slim
+    environment:
+      AWS_ACCESS_KEY_ID: celld
+      AWS_SECRET_ACCESS_KEY: celldcelld
+      CELLD_WATCH: /var/lib/celld
+      RUST_LOG: info
+      # celld refuses to start on an unspecified listen address without knowing
+      # what peers should dial. One node here, so it advertises its own name.
+      CELLD_ADVERTISE: celld:8080
+    volumes:
+      - tools:/opt/celld
+    ports:
+      - "18080:8080"   # 8080 is commonly taken on a dev laptop
+    command:
+      - /opt/celld/celld
+      - --bucket
+      - s3://celld
+      - --endpoint
+      - http://toxiproxy:9000
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+
+volumes:
+  tools:
