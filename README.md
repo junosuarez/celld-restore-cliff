@@ -6,10 +6,19 @@ restore outlives the request, the work is discarded, and the next request repeat
 stays healthy; one cell is simply gone.
 
 ```sh
-./run.sh
+./run.sh                      # celld v0.2.0 (default): recovers — the fix works
+CELLD_VERSION=v0.1.0 ./run.sh # the original failure: hangs forever
 ```
 
-About two minutes, one command, no arguments. Needs Docker (or Podman) and `curl`.
+About two minutes, one command. Needs Docker (or Podman) and `curl`.
+
+**Fixed in celld v0.2.0** ([denoland/celld#143](https://github.com/denoland/celld/issues/143)),
+which added LTX compaction (~256:1) and 64-way restore concurrency. This repo now serves two
+purposes: `CELLD_VERSION=v0.1.0` still demonstrates the original bug, and the default runs as a
+regression test that it stays fixed. Tag `v0.1.0` marks the state of this repo when the bug was
+live.
+
+There is also `./run-backlog.sh`, a second probe described at the end.
 
 ## What you should see
 
@@ -106,6 +115,52 @@ possibly restore inside the deadline retries forever rather than reporting why.
 - Compaction is presumably the intended fix, and the code anticipates it (`replica.rs`, *"L0-only
   … so adding compaction later 'just works'"*). Until then, either carrying restore progress
   across attempts or running activation off the request path would break the loop on its own.
+
+## `run-backlog.sh` — a probe that (correctly) fails to reproduce
+
+Model-checking v0.2.0's compaction suggested a surviving liveness hole: compaction runs only on
+a **resident, owned** cell, so it cannot rescue a cell that has already grown too large to open —
+opening it is exactly what is impossible. The way in would be upstream's own rolling-upgrade
+instruction, `CELLD_LTX_COMPACTION=0` on every node, during which a write-hot cell rebuilds an
+uncompacted backlog.
+
+`run-backlog.sh` builds that backlog and then "finishes the upgrade" by restarting with
+compaction on. **It does not reproduce**, and the reason is worth stating: the deadlock needs one
+more premise — that a restore outliving its triggering request is *discarded*. v0.1.0 did that.
+v0.2.0 does not. Measured here with a **16,019-object** uncompacted backlog at 250 ms/object, the
+cell recovered in ~48 s while individual requests were timing out at 12 s.
+
+So it is kept as a **regression test** for the property that makes the rest safe: activation must
+outlive the request that triggered it. If that ever regresses, compaction cannot paper over it.
+
+One incidental finding from building it: inject enough latency (~3 s/object) and celld halts with
+`SELF-FENCE: node lease not renewed within TTL` (exit 3) rather than serving. That is correct —
+a node that cannot reach the store must not keep owning cells — but it means a sufficiently slow
+store takes the whole node down, not one cell. It also puts a ceiling on latency injection as a
+test technique, since the lease TTL trips before the restore deadline does.
+
+## `run-backlog.sh` — a probe that (correctly) fails to reproduce
+
+Model-checking v0.2.0's compaction suggested a surviving liveness hole: compaction runs only on
+a **resident, owned** cell, so it cannot rescue a cell that has already grown too large to open —
+opening it is exactly what is impossible. The way in would be upstream's own rolling-upgrade
+instruction, `CELLD_LTX_COMPACTION=0` on every node, during which a write-hot cell rebuilds an
+uncompacted backlog.
+
+`run-backlog.sh` builds that backlog and then "finishes the upgrade" by restarting with
+compaction on. **It does not reproduce**, and the reason is worth stating: the deadlock needs one
+more premise — that a restore outliving its triggering request is *discarded*. v0.1.0 did that.
+v0.2.0 does not. Measured here with a **16,019-object** uncompacted backlog at 250 ms/object, the
+cell recovered in ~48 s while individual requests were timing out at 12 s.
+
+So it is kept as a **regression test** for the property that makes the rest safe: activation must
+outlive the request that triggered it. If that ever regresses, compaction cannot paper over it.
+
+One incidental finding from building it: inject enough latency (~3 s/object) and celld halts with
+`SELF-FENCE: node lease not renewed within TTL` (exit 3) rather than serving. That is correct —
+a node that cannot reach the store must not keep owning cells — but it means a sufficiently slow
+store takes the whole node down, not one cell. It also puts a ceiling on latency injection as a
+test technique, since the lease TTL trips before the restore deadline does.
 
 ## Teardown
 

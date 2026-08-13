@@ -54,6 +54,10 @@ services:
   # `celld deploy` to bundle the Worker.
   tools:
     image: docker.io/curlimages/curl:8.11.1
+    environment:
+      # v0.2.0 (current) fixes the simple cliff with LTX compaction plus 64-way
+      # restore concurrency. Set v0.1.0 to see the original failure.
+      CELLD_VERSION: "${CELLD_VERSION:-v0.2.0}"
     volumes:
       - tools:/opt/celld
     entrypoint:
@@ -61,28 +65,31 @@ services:
       - -c
       - |
         set -eu
+        V="$${CELLD_VERSION:-v0.2.0}"
         case "$$(uname -m)" in
-          aarch64|arm64)
-            CT=aarch64-unknown-linux-gnu
-            CS=256d25275ae85371c01a9a7f5dc553be41aedd9c79b656bf6b7154466f003182
-            EB=linux-arm64 ;;
-          x86_64|amd64)
-            CT=x86_64-unknown-linux-gnu
-            CS=139354c28618fe648864598f5cdf69ae91a176b32b90418a813e026e86be9a7c
-            EB=linux-x64 ;;
+          aarch64|arm64) CT=aarch64-unknown-linux-gnu; EB=linux-arm64 ;;
+          x86_64|amd64)  CT=x86_64-unknown-linux-gnu;  EB=linux-x64 ;;
           *) echo "unsupported arch $$(uname -m)" >&2; exit 1 ;;
         esac
-        [ -x /opt/celld/celld ] || {
-          curl -fsSL -o /tmp/c.gz "https://github.com/denoland/celld/releases/download/v0.1.0/celld-$$CT.gz"
+        case "$$V/$$CT" in
+          v0.1.0/aarch64*) CS=256d25275ae85371c01a9a7f5dc553be41aedd9c79b656bf6b7154466f003182 ;;
+          v0.1.0/x86_64*)  CS=139354c28618fe648864598f5cdf69ae91a176b32b90418a813e026e86be9a7c ;;
+          v0.2.0/aarch64*) CS=434abf9904dccd6b6369fa7a4a816038b367a6983e23a5d83ca2e6888202eac0 ;;
+          v0.2.0/x86_64*)  CS=90cd071633d4c8d7956b6828a76d434315c91972750cd82df510b0e5e383d0f7 ;;
+          *) echo "no pinned checksum for $$V on $$CT — add one rather than skipping the check" >&2; exit 1 ;;
+        esac
+        if [ ! -x /opt/celld/celld ] || [ "$$(cat /opt/celld/.version 2>/dev/null)" != "$$V" ]; then
+          curl -fsSL -o /tmp/c.gz "https://github.com/denoland/celld/releases/download/$$V/celld-$$CT.gz"
           echo "$$CS  /tmp/c.gz" | sha256sum -c -
           gunzip -c /tmp/c.gz > /opt/celld/celld && chmod +x /opt/celld/celld
-        }
+          echo "$$V" > /opt/celld/.version
+        fi
         [ -x /opt/celld/esbuild ] || {
           curl -fsSL -o /tmp/e.tgz "https://registry.npmjs.org/@esbuild/$$EB/-/$$EB-0.28.2.tgz"
           tar -xzf /tmp/e.tgz -C /tmp
           cp /tmp/package/bin/esbuild /opt/celld/esbuild && chmod +x /opt/celld/esbuild
         }
-        echo "tools ready for $$(uname -m)"
+        echo "tools ready: celld $$V on $$(uname -m)"
 
   deploy:
     image: docker.io/library/debian:stable-slim
@@ -108,7 +115,12 @@ services:
       RUST_LOG: info
       # celld refuses to start on an unspecified listen address without knowing
       # what peers should dial. One node here, so it advertises its own name.
-      CELLD_ADVERTISE: celld:8080
+      CELLD_ADVERTISE: celld:8081
+      CELLD_INTERNAL_ADDR: 0.0.0.0:8081
+      # v0.2.0 knob. Upstream tells you to set this to 0 on EVERY node during a
+      # mixed-version rolling upgrade, because an old reader cannot take over a
+      # cell after its first L1 publication. run-backlog.sh uses that window.
+      CELLD_LTX_COMPACTION: "${CELLD_LTX_COMPACTION:-1}"
     volumes:
       - tools:/opt/celld
     ports:
